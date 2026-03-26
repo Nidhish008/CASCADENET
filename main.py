@@ -1,5 +1,8 @@
 import os
+import sys
 import logging
+import subprocess
+from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -106,6 +109,47 @@ class TelemetryPayload(BaseModel):
     data: List[TelemetryData]
 
 
+BASE_DIR = Path(__file__).resolve().parent
+SIMULATOR_SCRIPT = BASE_DIR / "simulator.py"
+simulator_process = None
+
+
+def run_cascade_algorithm(session):
+    """Executes cascading failure logic until no overloaded ONLINE transformers remain."""
+    cascade_in_progress = True
+
+    while cascade_in_progress:
+        overloaded_nodes = session.run("""
+            MATCH (t:Transformer)
+            WHERE t.status = 'ONLINE' AND t.current_load > t.max_capacity
+            RETURN t.name AS id, t.current_load AS load
+        """).data()
+
+        if len(overloaded_nodes) == 0:
+            cascade_in_progress = False
+            break
+
+        for node in overloaded_nodes:
+            failing_id = node['id']
+            orphaned_load = node['load']
+
+            session.run("MATCH (t:Transformer {name: $id}) SET t.status = 'OFFLINE'", id=failing_id)
+
+            surviving_neighbors = session.run("""
+                MATCH (t:Transformer {name: $id})-[:CONNECTED_TO]-(neighbor:Transformer)
+                WHERE neighbor.status = 'ONLINE'
+                RETURN neighbor.name AS id
+            """, id=failing_id).data()
+
+            if surviving_neighbors:
+                split_load = orphaned_load / len(surviving_neighbors)
+                for neighbor in surviving_neighbors:
+                    session.run("""
+                        MATCH (n:Transformer {name: $id})
+                        SET n.current_load = n.current_load + $extra_load
+                    """, id=neighbor['id'], extra_load=split_load)
+
+
 # ==========================================
 # Core Endpoints
 # ==========================================
@@ -158,6 +202,45 @@ def get_grid_state():
 
     return {"elements": {"nodes": nodes, "edges": edges}}
 
+
+@app.post("/api/control-power")
+def control_power(payload: TelemetryPayload):
+    """Sets transformer loads directly from the control panel and runs cascade checks."""
+    with db_manager.driver.session() as session:
+        for item in payload.data:
+            session.run("""
+                MATCH (t:Transformer {name: $id})
+                SET t.current_load = $load
+            """, id=item.transformer_id, load=item.load_kw)
+
+        run_cascade_algorithm(session)
+
+    return {"message": "Power controls applied and cascade logic evaluated."}
+
+
+@app.post("/api/trigger-domino")
+def trigger_domino(spike: SpikeRequest):
+    """Injects a load spike for a specific transformer and executes cascade logic."""
+    with db_manager.driver.session() as session:
+        existing = session.run(
+            "MATCH (t:Transformer {name: $id}) RETURN t.name AS id",
+            id=spike.target_name
+        ).single()
+
+        if not existing:
+            raise HTTPException(status_code=404, detail=f"Transformer '{spike.target_name}' not found")
+
+        session.run("""
+            MATCH (t:Transformer {name: $id})
+            SET t.current_load = t.current_load + $added_load
+        """, id=spike.target_name, added_load=spike.added_load)
+
+        run_cascade_algorithm(session)
+
+    return {
+        "message": f"Domino event triggered on {spike.target_name} (+{spike.added_load} kW)."
+    }
+
 @app.post("/api/telemetry")
 def process_telemetry(payload: TelemetryPayload):
     """The Cascade Engine: Receives EV spikes, updates loads, and recursively calculates cascading failures."""
@@ -169,46 +252,70 @@ def process_telemetry(payload: TelemetryPayload):
                 SET t.current_load = $load
             """, id=item.transformer_id, load=item.load_kw)
 
-        # STEP 2: The Domino Effect Loop
-        cascade_in_progress = True
-        
-        while cascade_in_progress:
-            # Find any ONLINE transformer currently overloaded
-            overloaded_nodes = session.run("""
-                MATCH (t:Transformer) 
-                WHERE t.status = 'ONLINE' AND t.current_load > t.max_capacity 
-                RETURN t.name AS id, t.current_load AS load
-            """).data()
-
-            # If grid stabilized, break loop
-            if len(overloaded_nodes) == 0:
-                cascade_in_progress = False
-                break
-
-            for node in overloaded_nodes:
-                failing_id = node['id']
-                orphaned_load = node['load']
-
-                # 1. Kill the overloaded transformer
-                session.run("MATCH (t:Transformer {name: $id}) SET t.status = 'OFFLINE'", id=failing_id)
-
-                # 2. Find surviving neighbors
-                surviving_neighbors = session.run("""
-                    MATCH (t:Transformer {name: $id})-[:CONNECTED_TO]-(neighbor:Transformer) 
-                    WHERE neighbor.status = 'ONLINE' 
-                    RETURN neighbor.name AS id
-                """, id=failing_id).data()
-
-                # 3. Shift the load
-                if surviving_neighbors:
-                    split_load = orphaned_load / len(surviving_neighbors)
-                    for neighbor in surviving_neighbors:
-                        session.run("""
-                            MATCH (n:Transformer {name: $id}) 
-                            SET n.current_load = n.current_load + $extra_load
-                        """, id=neighbor['id'], extra_load=split_load)
+        # STEP 2: Domino-effect cascade evaluation
+        run_cascade_algorithm(session)
 
     return {"message": "Telemetry processed. Cascade algorithms executed."}
+
+
+@app.get("/api/simulator/status")
+def get_simulator_status():
+    global simulator_process
+    running = simulator_process is not None and simulator_process.poll() is None
+    return {
+        "running": running,
+        "pid": simulator_process.pid if running else None
+    }
+
+
+@app.post("/api/simulator/start")
+def start_simulator():
+    global simulator_process
+
+    if not SIMULATOR_SCRIPT.exists():
+        raise HTTPException(status_code=404, detail="simulator.py not found")
+
+    if simulator_process is not None and simulator_process.poll() is None:
+        return {
+            "message": "Simulator is already running.",
+            "pid": simulator_process.pid
+        }
+
+    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+    try:
+        simulator_process = subprocess.Popen(
+            [sys.executable, str(SIMULATOR_SCRIPT)],
+            cwd=str(BASE_DIR),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to start simulator: {exc}")
+
+    return {
+        "message": "Simulator started successfully.",
+        "pid": simulator_process.pid
+    }
+
+
+@app.post("/api/simulator/stop")
+def stop_simulator():
+    global simulator_process
+
+    if simulator_process is None or simulator_process.poll() is not None:
+        simulator_process = None
+        return {"message": "Simulator is not running."}
+
+    try:
+        simulator_process.terminate()
+        simulator_process.wait(timeout=5)
+    except Exception:
+        simulator_process.kill()
+    finally:
+        simulator_process = None
+
+    return {"message": "Simulator stopped."}
 
 @app.get("/api/health")
 async def health_check():
