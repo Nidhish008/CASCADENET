@@ -1,3 +1,20 @@
-MATCH (n:Transformer) 
-RETURN n.name, n.status, n.current_load 
-ORDER BY n.name
+CREATE
+	(a:Transformer {id: 'TX-A', status: 'ONLINE', load_kw: 82.0, capacity_kw: 150.0}),
+	(b:Transformer {id: 'TX-B', status: 'ONLINE', load_kw: 64.0, capacity_kw: 150.0}),
+	(c:Transformer {id: 'TX-C', status: 'ONLINE', load_kw: 71.0, capacity_kw: 150.0}),
+	(d:Transformer {id: 'TX-D', status: 'ONLINE', load_kw: 58.0, capacity_kw: 150.0}),
+	(e:Transformer {id: 'TX-E', status: 'ONLINE', load_kw: 47.0, capacity_kw: 150.0}),
+	(f:Transformer {id: 'TX-F', status: 'ONLINE', load_kw: 69.0, capacity_kw: 150.0}),
+	(g:Transformer {id: 'TX-G', status: 'ONLINE', load_kw: 51.0, capacity_kw: 150.0}),
+	(h:Transformer {id: 'TX-H', status: 'ONLINE', load_kw: 44.0, capacity_kw: 150.0}),
+
+	(a)-[:CONNECTED_TO {capacity_kw: 160.0}]->(b),
+	(b)-[:CONNECTED_TO {capacity_kw: 160.0}]->(c),
+	(c)-[:CONNECTED_TO {capacity_kw: 160.0}]->(d),
+	(d)-[:CONNECTED_TO {capacity_kw: 160.0}]->(e),
+	(e)-[:CONNECTED_TO {capacity_kw: 160.0}]->(f),
+	(f)-[:CONNECTED_TO {capacity_kw: 160.0}]->(g),
+	(g)-[:CONNECTED_TO {capacity_kw: 160.0}]->(h),
+	(h)-[:CONNECTED_TO {capacity_kw: 160.0}]->(a),
+	(a)-[:CONNECTED_TO {capacity_kw: 120.0}]->(e),
+	(c)-[:CONNECTED_TO {capacity_kw: 120.0}]->(g);
